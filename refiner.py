@@ -726,7 +726,8 @@ def process_directory(input_dir, output_dir, acceleration, prompt, safetensor_pa
                 strength,
                 scale_down,
                 cfg,
-                steps
+                steps,
+                upscale_model_path
             )
             if success:
                 main_pbar.update(1)
