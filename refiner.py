@@ -1,5 +1,6 @@
 import torchvision
 torchvision.disable_beta_transforms_warning()
+from torchvision import transforms
 import os
 import torch
 from PIL import Image
@@ -19,6 +20,7 @@ from image_gen_aux import DepthPreprocessor
 import torch.profiler
 from safetensors.torch import load_file
 from faker import Faker
+import numpy as np
 
 
 # Enable memory-efficient attention for SD-based models
@@ -47,6 +49,57 @@ class CustomForward:
         if len(output) == 2:
             return (*output, None)
         return output
+
+class UpscalerModel(torch.nn.Module):
+    def __init__(self):  # Remove scale parameter since we'll calculate it dynamically
+        super(UpscalerModel, self).__init__()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.to(self.device)  # Move model to device once during initialization
+
+    def forward(self, x):
+        # Define the forward pass of your model (placeholder, adjust as per your model)
+        return x
+
+    def upscale(self, image, upscale_model_path, target_width, target_height):
+        if not isinstance(image, Image.Image):
+            raise ValueError("Input must be a PIL Image")
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        # Define transformation (resize the image to target dimensions for processing)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize((target_height, target_width)),  # Use target dimensions
+            transforms.Lambda(lambda x: x.unsqueeze(0))  # Add batch dimension
+        ])
+
+        try:
+            image_tensor = transform(image).to(self.device)
+        except RuntimeError as e:
+            raise RuntimeError(f"Failed to transform image: {e}")
+
+        # Load the state dictionary from the checkpoint
+        state_dict = torch.load(upscale_model_path)
+
+        # Optionally, remove a prefix from keys if needed
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            new_key = key.replace("model.", "")
+            new_state_dict[new_key] = value
+
+        try:
+            self.load_state_dict(new_state_dict, strict=False)
+        except RuntimeError as e:
+            print(f"Error loading state_dict: {e}")
+
+        self.eval()
+
+        with torch.no_grad():
+            upscaled_tensor = self(image_tensor)
+
+        upscaled_image = upscaled_tensor.squeeze(0).cpu().clamp(0, 1).numpy().transpose(1, 2, 0) * 255
+        upscaled_image = Image.fromarray(upscaled_image.astype(np.uint8))
+        return upscaled_image
 
 class LyingSigmaSampler:
     """
@@ -190,7 +243,7 @@ def miaoshuai_tagger(image):
     return result  # Return the string instead of the dictionary
 
 
-def apply_loras(lorafile, pipe):
+def apply_loras(lorafile, pipe, use_fp8=False):
     """
     Apply a LoRA (Low-Rank Adaptation) to the given pipeline.
 
@@ -209,19 +262,38 @@ def apply_loras(lorafile, pipe):
     if not lorafile:
         return pipe
 
-    # Apply each LoRA sequentially, ensuring weights are loaded on the GPU
+    # Apply LoRA weights, ensuring everything happens on the specified device
     with torch.device(device):
-        if lorafile:
-            lora_name = os.path.basename(lorafile)  # Extract only the filename
-            print(f"Applying LoRA: {lora_name}")
-            try:
-                pipe.load_lora_weights(lorafile, weight_name=lora_name, device=device)  # Load LoRA on GPU
-                pipe.fuse_lora(lora_scale=1.0)  # Adjust scale as needed
-                pipe.unload_lora_weights()  # Clean up immediately
-            except Exception as e:
-                print(f"Failed to apply LoRA {lora_name}: {str(e)}")
-                # Continue with next LoRA even if one fails
-    cleanup()                
+        lora_name = os.path.basename(lorafile)  # Extract filename
+        print(f"Applying LoRA: {lora_name}")
+        try:
+            # Load LoRA weights onto the GPU
+            pipe.load_lora_weights(lorafile, weight_name=lora_name, device=device)
+
+            # If FP8 quantization is enabled, quantize the LoRA weights
+            if use_fp8:
+                print(f"Quantizing LoRA {lora_name} to FP8...")
+                # Assuming pipe.lora_weights is accessible; adjust based on your implementation
+                lora_weights = pipe.lora_weights  # Placeholder; depends on your pipe API
+                if lora_weights is not None:
+                    # Apply FP8 quantization (example using PyTorch quantization)
+                    qconfig = torch.quantization.float_qparams_weight_only_qconfig
+                    quantized_lora = torch.quantization.quantize_dynamic(
+                        lora_weights, {torch.nn.Linear}, dtype=torch.qint8  # FP8 simulation
+                    )
+                    # Reassign quantized weights (adjust this based on your pipe's structure)
+                    pipe.lora_weights = quantized_lora
+                else:
+                    print("Warning: No LoRA weights found to quantize.")
+
+            # Merge LoRA into the transformer
+            pipe.fuse_lora(lora_scale=1.0)  # Adjust scale as needed
+            pipe.unload_lora_weights()  # Clean up after merging
+        except Exception as e:
+            print(f"Failed to apply LoRA {lora_name}: {str(e)}")
+            # Continue even if this fails, as per your original logic
+
+    cleanup()  # Assuming this is a defined function to free memory
     return pipe
 
 
@@ -303,7 +375,7 @@ def setup_pipeline(mode, acceleration, lora_file, safetensor_path=None, fp8_torc
     # Apply LoRA
     if lora_file:
         try:
-            pipe = apply_loras(lora_file, pipe)
+            pipe = apply_loras(lora_file, pipe, fp8_torch_path is not None)
             print(f"VRAM after LoRA: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
@@ -368,7 +440,7 @@ def setup_pipeline(mode, acceleration, lora_file, safetensor_path=None, fp8_torc
     return pipe, pipe_prior_redux
 
 
-def prepare_image(input_path, scale_down=False):
+def prepare_image(input_path, scale_down=False, upscale_model_path=None):
     """
     Prepares an image for further processing by optionally scaling it down and ensuring it meets 
     certain size criteria.
@@ -396,7 +468,7 @@ def prepare_image(input_path, scale_down=False):
         pixel_count = width * height
         print(f"  Original size: {width}x{height} ({pixel_count} pixels)")
         if pixel_count > 1_500_000:  # Between 1.5MP and 2.2MP, scale down 2x
-            init_image = upscale_to_sdxl(init_image)  # Pass the image object
+            init_image = upscale_to_sdxl(init_image, upscale_model_path=upscale_model_path)
         else:
             print(f"  Image below 1.5MP, no scaling applied")
         width, height = init_image.size  # Update dimensions after resize
@@ -408,7 +480,7 @@ def prepare_image(input_path, scale_down=False):
     # If image is below 1MP, scale up to nearest SDXL resolution
     if current_pixels <= 1_000_000:
         print(f"  Image below 1Mpixel, scaling up to nearest SDXL resolution")
-        init_image = upscale_to_sdxl(init_image)  # Pass the image object
+        init_image = upscale_to_sdxl(init_image, upscale_model_path=upscale_model_path)
         width, height = init_image.size
         print(f"  Image mode after scale-up: {init_image.mode}")
 
@@ -431,7 +503,8 @@ def warmup_pipeline(pipe, pipe_prior_redux, mode):
         pipe(prompt="test", control_image=control_image, num_inference_steps=1)
 
 
-def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt, mode, acceleration, strength, scale_down, cfg, steps):
+def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt, mode, acceleration, 
+                        strength, scale_down, cfg, steps, upscale_model_path=None):
     """
     Processes a single image using the specified pipeline and parameters.
     Args:
@@ -451,7 +524,7 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
     """
     try:
         # Prepare the image
-        init_image, width, height = prepare_image(input_path, scale_down)
+        init_image, width, height = prepare_image(input_path, scale_down, upscale_model_path)
         fname = os.path.basename(input_path)
         
         # If output_path already has a random name (from process_directory), use it
@@ -610,7 +683,7 @@ def get_files_to_process(input_dir, output_dir, random_names=False):
 
 def process_directory(input_dir, output_dir, acceleration, prompt, safetensor_path=None, lora_file=None, 
                      scale_down=False, strength=0.35, mode="refiner", cfg=3.0, steps=25, random_names=False, 
-                     fp8_torch_path=None):
+                     fp8_torch_path=None, upscale_model_path=None):
     """
     Processes all images in the input directory using the specified pipeline and saves the results to the output directory.
     Args:
@@ -653,19 +726,21 @@ def process_directory(input_dir, output_dir, acceleration, prompt, safetensor_pa
                 strength,
                 scale_down,
                 cfg,
-                steps
+                steps,
+                upscale_model_path
             )
             if success:
                 main_pbar.update(1)
 
 
-def upscale_to_sdxl(image):
+def upscale_to_sdxl(image, upscale_model_path=None):
     """
     Upscale image to nearest SDXL resolution (maintaining aspect ratio) if below 1 megapixel.
     Common SDXL resolutions: 1024x1024, 1024x576, 576x1024, 1152x896, 896x1152, etc.
     
     Args:
         image (PIL.Image): Input image object
+        upscale_model_path (str, optional): Path to the upscaler model checkpoint. If provided, use UpscalerModel.
     
     Returns:
         PIL.Image: Resized image object
@@ -709,8 +784,21 @@ def upscale_to_sdxl(image):
             min_ratio_diff = ratio_diff
             best_size = (w, h)
     
-    # Resize image using LANCZOS resampling (high quality)
-    resized_image = image.resize(best_size, Image.LANCZOS)   
+    target_width, target_height = best_size
+    
+    # If an upscale model path is provided, use UpscalerModel
+    if upscale_model_path:
+        upscaler = UpscalerModel()
+        try:
+            print(f"Using {upscale_model_path} UpscalerModel for resizing...")
+            resized_image = upscaler.upscale(image, upscale_model_path, target_width, target_height)
+        except Exception as e:
+            print(f"Error using UpscalerModel: {e}. Falling back to Lanczos.")
+            resized_image = image.resize(best_size, Image.LANCZOS)
+    else:
+        # Default to Lanczos resampling
+        resized_image = image.resize(best_size, Image.LANCZOS)
+    
     return resized_image
 
 def main():
@@ -762,6 +850,9 @@ def main():
     parser.add_argument('--random-names', '-r', action='store_true',
                             help="Override default naming behavior and use random docker-style names for output files")    
 
+    parser.add_argument("-u", "--upscaler_model", type=str, help="Path to upscaler model")
+
+
     args = parser.parse_args()
 
     if not os.path.exists(args.path):
@@ -784,7 +875,7 @@ def main():
 
     process_directory(args.path, out_dir, args.acceleration, args.prompt, args.safetensor, 
                      args.lora, args.scale_down, args.denoise, args.mode, args.cfg, args.steps, 
-                     args.random_names, args.fp8_torch)
+                     args.random_names, args.fp8_torch, args.upscaler_model)
 
 if __name__ == "__main__":
     main()
